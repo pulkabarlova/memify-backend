@@ -1,0 +1,99 @@
+name: Deploy production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: memify-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and deploy backend
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production
+      url: https://api.memify.space/posts
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Build fat JAR
+        run: ./gradlew --no-daemon buildFatJar
+
+      - name: Read artifact metadata
+        working-directory: build/libs
+        run: |
+          test -s backend-all.jar
+          echo "ARTIFACT_SHA256=$(sha256sum backend-all.jar | cut -d' ' -f1)" >>"$GITHUB_ENV"
+          echo "ARTIFACT_SIZE=$(stat --format='%s' backend-all.jar)" >>"$GITHUB_ENV"
+
+      - name: Download cloudflared
+        env:
+          CLOUDFLARED_VERSION: 2026.8.2
+        run: |
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-all-errors \
+            --silent \
+            --show-error \
+            "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64" \
+            --output "$RUNNER_TEMP/cloudflared"
+          chmod 0755 "$RUNNER_TEMP/cloudflared"
+          "$RUNNER_TEMP/cloudflared" --version
+
+      - name: Configure deploy key
+        env:
+          PRODUCTION_SSH_KEY: ${{ secrets.PRODUCTION_SSH_KEY }}
+        run: |
+          test -n "$PRODUCTION_SSH_KEY"
+          install -d -m 0700 "$RUNNER_TEMP/memify-ssh"
+          printf '%s\n' "$PRODUCTION_SSH_KEY" >"$RUNNER_TEMP/memify-ssh/id_ed25519"
+          chmod 0600 "$RUNNER_TEMP/memify-ssh/id_ed25519"
+
+      - name: Deploy backend
+        env:
+          DEPLOY_KEY: ${{ runner.temp }}/memify-ssh/id_ed25519
+        run: |
+          ssh \
+            -i "$DEPLOY_KEY" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=deploy/known_hosts \
+            -o "ProxyCommand=$RUNNER_TEMP/cloudflared access ssh --hostname %h" \
+            memify-deployer@ssh.memify.space \
+            "deploy $GITHUB_SHA $ARTIFACT_SHA256 $ARTIFACT_SIZE" \
+            <build/libs/backend-all.jar
+
+      - name: Check public posts endpoint
+        run: |
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --retry 5 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            --max-time 15 \
+            https://api.memify.space/posts \
+            --output /dev/null

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+umask 077
+
+readonly INCOMING_DIR="/home/memify-deployer/incoming"
+readonly ORIGINAL_COMMAND="${SSH_ORIGINAL_COMMAND:-}"
+
+if [[ ! "${ORIGINAL_COMMAND}" =~ ^deploy\ ([0-9a-f]{40})\ ([0-9a-f]{64})\ ([0-9]{1,12})$ ]]; then
+    echo "Only a validated Memify deployment command is allowed" >&2
+    exit 2
+fi
+
+readonly REVISION="${BASH_REMATCH[1]}"
+readonly EXPECTED_SHA256="${BASH_REMATCH[2]}"
+readonly EXPECTED_SIZE="${BASH_REMATCH[3]}"
+
+if ((EXPECTED_SIZE < 1048576 || EXPECTED_SIZE > 209715200)); then
+    echo "Artifact size is outside the expected 1-200 MiB range: ${EXPECTED_SIZE}" >&2
+    exit 2
+fi
+
+mkdir -p -- "${INCOMING_DIR}"
+chmod 0700 "${INCOMING_DIR}"
+
+readonly INCOMING_JAR="$(mktemp "${INCOMING_DIR}/backend-all.jar.XXXXXXXX")"
+cleanup() {
+    rm -f -- "${INCOMING_JAR}"
+}
+trap cleanup EXIT
+
+cat >"${INCOMING_JAR}"
+
+readonly ACTUAL_SIZE="$(stat --format='%s' -- "${INCOMING_JAR}")"
+if [[ "${ACTUAL_SIZE}" != "${EXPECTED_SIZE}" ]]; then
+    echo "Artifact size mismatch: expected ${EXPECTED_SIZE}, got ${ACTUAL_SIZE}" >&2
+    exit 1
+fi
+
+readonly ACTUAL_SHA256="$(sha256sum "${INCOMING_JAR}" | cut -d' ' -f1)"
+if [[ "${ACTUAL_SHA256}" != "${EXPECTED_SHA256}" ]]; then
+    echo "Artifact checksum mismatch" >&2
+    exit 1
+fi
+
+sudo /usr/local/sbin/memify-deploy "${INCOMING_JAR}" "${REVISION}"

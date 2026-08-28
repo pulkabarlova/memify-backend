@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+umask 027
+
+readonly APP_DIR="/opt/memify"
+readonly BACKUP_DIR="${APP_DIR}/backups"
+readonly LOCK_FILE="/run/lock/memify-deploy.lock"
+readonly INCOMING_DIR="/home/memify-deployer/incoming"
+readonly HEALTH_URL="http://127.0.0.1:8080/posts"
+readonly BACKUPS_TO_KEEP=5
+
+usage() {
+    echo "Usage: memify-deploy <backend-all.jar> <40-character-git-sha>" >&2
+    exit 2
+}
+
+if [[ "${EUID}" -ne 0 ]]; then
+    echo "memify-deploy must run as root" >&2
+    exit 1
+fi
+
+if [[ "$#" -ne 2 ]]; then
+    usage
+fi
+
+readonly SOURCE_JAR="$1"
+readonly REVISION="$2"
+
+if [[ ! "${REVISION}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "Invalid Git revision: ${REVISION}" >&2
+    exit 2
+fi
+
+if [[ ! -f "${SOURCE_JAR}" || -L "${SOURCE_JAR}" ]]; then
+    echo "Artifact must be a regular file, not a symlink: ${SOURCE_JAR}" >&2
+    exit 2
+fi
+
+readonly RESOLVED_SOURCE_JAR="$(readlink -f -- "${SOURCE_JAR}")"
+if [[ "${RESOLVED_SOURCE_JAR}" != "${INCOMING_DIR}/"* ]]; then
+    echo "Artifact is outside the deployer incoming directory: ${RESOLVED_SOURCE_JAR}" >&2
+    exit 2
+fi
+
+if [[ "$(stat --format='%U' -- "${RESOLVED_SOURCE_JAR}")" != "memify-deployer" ]]; then
+    echo "Artifact is not owned by memify-deployer: ${RESOLVED_SOURCE_JAR}" >&2
+    exit 2
+fi
+
+readonly JAR_SIZE="$(stat --format='%s' -- "${RESOLVED_SOURCE_JAR}")"
+if ((JAR_SIZE < 1048576 || JAR_SIZE > 209715200)); then
+    echo "Artifact size is outside the expected 1-200 MiB range: ${JAR_SIZE}" >&2
+    exit 2
+fi
+
+for required_file in \
+    .env \
+    Dockerfile.cloud \
+    docker-compose.yml \
+    docker-compose.cloud.yml; do
+    if [[ ! -f "${APP_DIR}/${required_file}" ]]; then
+        echo "Missing production file: ${APP_DIR}/${required_file}" >&2
+        exit 1
+    fi
+done
+
+exec 9>"${LOCK_FILE}"
+if ! flock --nonblock 9; then
+    echo "Another Memify deployment is already running" >&2
+    exit 1
+fi
+
+compose() {
+    docker compose \
+        --project-directory "${APP_DIR}" \
+        --env-file "${APP_DIR}/.env" \
+        -f "${APP_DIR}/docker-compose.yml" \
+        -f "${APP_DIR}/docker-compose.cloud.yml" \
+        "$@"
+}
+
+wait_for_backend() {
+    local attempt
+    for attempt in {1..30}; do
+        if curl \
+            --fail \
+            --silent \
+            --show-error \
+            --max-time 5 \
+            "${HEALTH_URL}" \
+            --output /dev/null; then
+            return 0
+        fi
+        sleep 2
+    done
+
+    return 1
+}
+
+readonly DEPLOYED_AT="$(date -u +'%Y%m%dT%H%M%SZ')"
+readonly RELEASE_NAME="${DEPLOYED_AT}-${REVISION:0:12}"
+readonly CURRENT_JAR="${APP_DIR}/backend-all.jar"
+readonly RELEASE_BACKUP_DIR="${BACKUP_DIR}/${RELEASE_NAME}"
+
+mkdir -p -- "${RELEASE_BACKUP_DIR}"
+if [[ -f "${CURRENT_JAR}" ]]; then
+    install \
+        --owner=root \
+        --group=root \
+        --mode=0644 \
+        "${CURRENT_JAR}" \
+        "${RELEASE_BACKUP_DIR}/backend-all.jar"
+fi
+
+rollback() {
+    local exit_code=$?
+    trap - ERR
+    set +e
+
+    echo "Deployment failed; restoring the previous backend artifact" >&2
+    compose logs --no-color --tail=100 backend >&2
+
+    if [[ -f "${RELEASE_BACKUP_DIR}/backend-all.jar" ]]; then
+        install \
+            --owner=root \
+            --group=root \
+            --mode=0644 \
+            "${RELEASE_BACKUP_DIR}/backend-all.jar" \
+            "${CURRENT_JAR}"
+        compose up -d --build --no-deps backend
+        wait_for_backend
+    else
+        echo "No previous artifact is available for rollback" >&2
+    fi
+
+    exit "${exit_code}"
+}
+trap rollback ERR
+
+install \
+    --owner=root \
+    --group=root \
+    --mode=0644 \
+    "${RESOLVED_SOURCE_JAR}" \
+    "${CURRENT_JAR}.next"
+mv --force -- "${CURRENT_JAR}.next" "${CURRENT_JAR}"
+
+compose config --quiet
+compose up -d --build --no-deps backend
+wait_for_backend
+
+printf '%s\n' "${REVISION}" >"${APP_DIR}/DEPLOYED_REVISION"
+chmod 0644 "${APP_DIR}/DEPLOYED_REVISION"
+
+trap - ERR
+
+mapfile -t old_backups < <(
+    find "${BACKUP_DIR}" \
+        -mindepth 1 \
+        -maxdepth 1 \
+        -type d \
+        -printf '%T@ %p\n' \
+        | sort --numeric-sort --reverse \
+        | cut -d' ' -f2-
+)
+
+if ((${#old_backups[@]} > BACKUPS_TO_KEEP)); then
+    for old_backup in "${old_backups[@]:BACKUPS_TO_KEEP}"; do
+        if [[ "${old_backup}" == "${BACKUP_DIR}/"* ]]; then
+            rm -rf -- "${old_backup}"
+        fi
+    done
+fi
+
+echo "Memify backend ${REVISION} is healthy at ${HEALTH_URL}"
