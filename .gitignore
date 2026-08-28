@@ -12,3 +12,4 @@ out/
 # секретные файлы — никогда не коммить
 firebase-service-account.json
 .env
+certs/

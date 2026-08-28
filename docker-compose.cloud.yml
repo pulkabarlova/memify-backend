@@ -1,0 +1,26 @@
+services:
+  db:
+    image: mirror.gcr.io/library/postgres:16
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.cloud
+
+  caddy:
+    image: mirror.gcr.io/library/caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certs:/etc/caddy/certs:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

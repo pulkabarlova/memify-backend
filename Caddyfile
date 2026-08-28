@@ -1,0 +1,4 @@
+api.memify.space {
+    tls /etc/caddy/certs/fullchain.pem /etc/caddy/certs/privkey.pem
+    reverse_proxy backend:8080
+}
