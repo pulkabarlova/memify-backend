@@ -52,6 +52,22 @@ is not opened in the Yandex Cloud security group.
 The deployment private key must exist only in GitHub Secrets and the temporary
 machine used during setup. It must never be added to the repository or `.env`.
 
+## Mirroring template images
+
+Imgflip is only a discovery source. Template images are served from Yandex
+Object Storage. Before the first deployment of this behavior, mirror every
+current template with:
+
+```shell
+python3 -m pip install boto3
+python3 deploy/mirror-template-images.py --env-file .env
+```
+
+Each Imgflip template has a deterministic object key under
+`templates/imgflip/`. On startup the backend switches existing template rows
+to these URLs. Later syncs preserve stored URLs and upload a new template
+before inserting or updating it.
+
 ## Infrastructure changes
 
 Routine workflow runs intentionally deploy only `backend-all.jar`. Changes to
